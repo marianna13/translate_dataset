@@ -17,7 +17,7 @@ if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 
 if torch.cuda.is_available():
-    device = torch.device("cuda:5")
+    device = torch.device("cuda")
     torch.cuda.empty_cache()
 else:
     device = torch.device("cpu")
