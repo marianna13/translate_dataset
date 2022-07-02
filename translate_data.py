@@ -74,7 +74,7 @@ def translate_part(tokenizer, model, start, end, small_dataset, DATA_DIR):
 
     if not os.path.exists(directory):
         os.makedirs(directory)
-    
+
     part_dataset = small_dataset.select([i for i in range(start, end, 1)])
 
     # get all languages that are presented in the dataset
@@ -95,7 +95,8 @@ def translate_part(tokenizer, model, start, end, small_dataset, DATA_DIR):
         except KeyError:
             continue
     # combine all parquet files into one
-    fs = [pd.read_parquet(directory+'/'+path) for path in os.listdir(directory)]
+    fs = [pd.read_parquet(directory+'/'+path)
+          for path in os.listdir(directory)]
     pd.concat(fs).to_parquet(f'{DATA_DIR}/{start}-{end}.parquet')
     # remove the directory that is not needed anymore
     shutil.rmtree(directory)
@@ -105,7 +106,18 @@ def worker():
     client = cah.init(
         url="http://cah.io.community/",
         device_id="cluster"
-    )      
+    )
+
+    tokenizer = M2M100Tokenizer.from_pretrained("facebook/m2m100_1.2B")
+
+    # target language
+    tokenizer.tgt_lang = "en"
+    model = M2M100ForConditionalGeneration.from_pretrained(
+        "facebook/m2m100_1.2B").to(device)
+    model.half()
+
+    # parallel model
+    model.share_memory()
 
     while client.jobCount() > 0 and not client.shouldDie():
         client.newJob()
@@ -119,7 +131,8 @@ def worker():
         DATA_DIR = TMP_DATA_DIR + f'/{url}_{partition}'
 
         dataset = load_dataset("laion/laion2B-multi", data_files=url)
-        shard = dataset.shard(354, partition, contiguous=True, keep_in_memory=True)
+        shard = dataset.shard(
+            354, partition, contiguous=True, keep_in_memory=True)
 
         s = time.time()
         # to make parallel GPU computations possible
@@ -129,17 +142,8 @@ def worker():
             pass
 
         # number of processes depends on the number of GPUs available, can be varied
-        num_processes = torch.cuda.device_count() # TODO is this right?
-        tokenizer = M2M100Tokenizer.from_pretrained("facebook/m2m100_1.2B")
+        num_processes = torch.cuda.device_count()  # TODO is this right?
 
-        # target language
-        tokenizer.tgt_lang = "en"
-        model = M2M100ForConditionalGeneration.from_pretrained(
-            "facebook/m2m100_1.2B").to(device)
-        model.half()
-
-        # parallel model
-        model.share_memory()
         processes = []
         n_samples = len(shard)
         c = int(n_samples/num_processes)
@@ -152,21 +156,23 @@ def worker():
             )
             p.start()
             processes.append(p)
-        
+
         for p in processes:
             p.join()
-        
+
         # combining parquet files for every process in one file
 
-        fs = [pd.read_parquet(DATA_DIR+'/'+path) for path in os.listdir(DATA_DIR)]
+        fs = [pd.read_parquet(DATA_DIR+'/'+path)
+              for path in os.listdir(DATA_DIR)]
 
         DATA_DIR_TRANSLATED = f'{FINAL_DATA_DIR}/{url}'
 
         if not os.path.exists(DATA_DIR_TRANSLATED):
             os.makedirs(DATA_DIR_TRANSLATED)
-        
-        pd.concat(fs).to_parquet(f'{DATA_DIR_TRANSLATED}/{url}_{partition}.parquet')
-    
+
+        pd.concat(fs).to_parquet(
+            f'{DATA_DIR_TRANSLATED}/{url}_{partition}.parquet')
+
         # remove the directories we don't need anymore
         shutil.rmtree(DATA_DIR)
 
@@ -174,7 +180,7 @@ def worker():
         print(f'Processed in {round(e-s, 2)} seconds')
 
         client.completeJob()
-    
+
     return 0
 
 
