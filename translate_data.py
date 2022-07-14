@@ -7,14 +7,17 @@ import shutil
 import pandas as pd
 from datasets import load_dataset
 from transformers import M2M100Tokenizer, M2M100ForConditionalGeneration
+from transformers.onnx import FeaturesManager
 import torch.multiprocessing as mp
+from pathlib import Path
 import captionsathome as cah
+from transformers import pipeline
 import torch
 set_verbosity_error()
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore")   
 
 TMP_DATA_DIR = 'DATA'
-FINAL_DATA_DIR = ''
+FINAL_DATA_DIR = 'DATA_'
 
 if not os.path.exists(TMP_DATA_DIR):
     os.makedirs(TMP_DATA_DIR)
@@ -23,15 +26,14 @@ if not os.path.exists(FINAL_DATA_DIR):
     os.makedirs(FINAL_DATA_DIR)
 
 if torch.cuda.is_available():
-    device = torch.device("cuda")
+    num_devices = torch.cuda.device_count()
     torch.cuda.empty_cache()
 else:
-    device = torch.device("cpu")
-
-print(f'Using: {device}')
+    assert False, "No GPU available"
 
 
-def translate(example, tokenizer, model):
+
+def translate(text, tokenizer, model, device):
     '''
     example:Dict[List] with len==batch_size
     tokenizer:transformers.PreTrainedTokenizer
@@ -39,29 +41,41 @@ def translate(example, tokenizer, model):
     returns:
     example with added column ENG TEXT
     '''
-    text = example["TEXT"]
+    # text = example["TEXT"]
+    torch.cuda.empty_cache()
+    
+    # translator = pipeline(task="translation_xx_to_yy", model=model, tokenizer=tokenizer)
     with torch.no_grad():
+        # eng_text = translator(
+        #     text, 
+        #     return_tensors="pt", 
+        #     clean_up_tokenization_spaces=True,
+        #     tgt_lang="en"
+        #     ) 
         encoded = tokenizer(text, return_tensors="pt",
-                            padding=True).to(device)
+                            padding=True ).to(device)
         generated_tokens = model.generate(
-            **encoded, forced_bos_token_id=tokenizer.get_lang_id("en"))
-        example["ENG TEXT"] = tokenizer.batch_decode(
+            **encoded, forced_bos_token_id=tokenizer.get_lang_id("en")
+            ).to(device)
+        eng_text = tokenizer.batch_decode(
             generated_tokens, skip_special_tokens=True)
-        return example
+        torch.cuda.empty_cache()
+        return eng_text
 
 
-def process_data(d, name, folder, tokenizer, model):
+def process_data(d, name, folder, tokenizer, model, device):
     '''
     d:dataset that we want to process
     name:str name of the parquet file (in our case language)
     folder:str folder to save processed data (different folder for each process)
     '''
-    d = d.map(lambda example: translate(example, tokenizer, model),
+    d = d.map(lambda example: {'ENG TEXT':translate(example['TEXT'], tokenizer, model, device)},
               batched=True, batch_size=10)
-    d.to_parquet(f'{folder}/{name}.parquet', batch_size=10)
+    # d = d.add_column('ENG TEXT', d_eng)
+    d.to_parquet(f'{folder}/{name}.parquet', batch_size=100)
 
 
-def translate_part(tokenizer, model, start, end, small_dataset, DATA_DIR):
+def translate_part(tokenizer, model, start, end, small_dataset,device, DATA_DIR):
     '''
     Translates part of the desired dataset.
     tokenizer:transformers.PreTrainedTokenizer
@@ -89,11 +103,13 @@ def translate_part(tokenizer, model, start, end, small_dataset, DATA_DIR):
                 lang,
                 directory,
                 tokenizer,
-                model
+                model,
+                device
             )
         # The model doeasn't support some languages
         except KeyError:
             continue
+        torch.cuda.empty_cache()
     # combine all parquet files into one
     fs = [pd.read_parquet(directory+'/'+path)
           for path in os.listdir(directory)]
@@ -108,31 +124,27 @@ def worker():
         device_id="cluster"
     )
 
-    tokenizer = M2M100Tokenizer.from_pretrained("facebook/m2m100_1.2B")
+    tokenizer = M2M100Tokenizer.from_pretrained("facebook/m2m100_1.2B", use_fast=True)
 
     # target language
     tokenizer.tgt_lang = "en"
-    model = M2M100ForConditionalGeneration.from_pretrained(
-        "facebook/m2m100_1.2B").to(device)
-    model.half()
-
-    # parallel model
-    model.share_memory()
-
+    
     while client.jobCount() > 0 and not client.shouldDie():
         client.newJob()
         client.log("Processing...")
+        client.log(client.tar_url)
+        
+        url, partition = client.tar_url.split("parquet:")
+        url += 'parquet'
+        url = url.split('/')[-1]
 
-        url, partition = client.tar_url.split(":")
+        print(url)
 
-        url = url.split("/")[-1]
-        partition = int(partition) - 1
+        DATA_DIR = TMP_DATA_DIR + f'/{url}'
 
-        DATA_DIR = TMP_DATA_DIR + f'/{url}_{partition}'
-
-        dataset = load_dataset("laion/laion2B-multi", data_files=url)
+        dataset = load_dataset("laion/laion2B-multi-joined", data_files=url, split="train")
         shard = dataset.shard(
-            354, partition, contiguous=True, keep_in_memory=True)
+            360, int(partition), contiguous=True, keep_in_memory=True)
 
         s = time.time()
         # to make parallel GPU computations possible
@@ -142,17 +154,27 @@ def worker():
             pass
 
         # number of processes depends on the number of GPUs available, can be varied
-        num_processes = torch.cuda.device_count()  # TODO is this right?
+        num_proc_per_device = 3
+        num_processes = num_devices*num_proc_per_device
+
+        device_ids = [i for i in range(num_devices)]*num_proc_per_device
 
         processes = []
         n_samples = len(shard)
         c = int(n_samples/num_processes)
         ranges = [[_, _+c] for _ in range(0, n_samples, c)]
-        for rank, rng in zip(range(num_processes), ranges):
+        for rank, rng, device_id in zip(range(num_processes), ranges, device_ids):
+            device = torch.device(f"cuda:{device_id}")
+            print(f'Using: {device}')
+            model = M2M100ForConditionalGeneration.from_pretrained(
+                "facebook/m2m100_1.2B").to(device)
+            model = model.half()
+            nodel = model.eval()
+            model.share_memory()
             start, end = rng
-            p = mp.Process(
+            p = mp.Process( 
                 target=translate_part,
-                args=[tokenizer, model, start, end, shard, DATA_DIR]
+                args=[tokenizer, model, start, end, dataset, device, DATA_DIR]
             )
             p.start()
             processes.append(p)
@@ -160,7 +182,7 @@ def worker():
         for p in processes:
             p.join()
 
-        # combining parquet files for every process in one file
+        # combining parquet files for every process into one file
 
         fs = [pd.read_parquet(DATA_DIR+'/'+path)
               for path in os.listdir(DATA_DIR)]
@@ -186,3 +208,4 @@ def worker():
 
 if __name__ == '__main__':
     exit(worker())
+    client.bye()
